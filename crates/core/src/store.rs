@@ -44,7 +44,7 @@ impl Store {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis()
+                .as_nanos()
         );
         self.conn.execute(
             "INSERT INTO search_results (id, query, confidence, bbox_x_min, bbox_y_min, bbox_x_max, bbox_y_max) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
