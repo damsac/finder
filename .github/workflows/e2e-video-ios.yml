@@ -105,12 +105,14 @@ jobs:
           URL=$(cargo run -p blossom-upload -- \
             --server https://blossom.primal.net \
             --server https://blossom.oxtr.dev \
-            recording.mp4 2>/dev/null || echo "")
+            recording.mp4 || echo "")
           if [ -z "$URL" ]; then
             echo "::warning::Blossom upload failed, uploading as artifact instead"
             echo "url=" >> "$GITHUB_OUTPUT"
           else
             echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "### E2E Video uploaded to Blossom" >> "$GITHUB_STEP_SUMMARY"
+            echo "[$URL]($URL)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload video as artifact (fallback)
