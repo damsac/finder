@@ -1,0 +1,160 @@
+name: E2E Video iOS
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "ios/**"
+      - "scripts/**"
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  e2e-video-ios:
+    runs-on: macos-15
+    env:
+      FFI_CRATE: finder-ffi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tools
+        run: brew install xcodegen xcbeautify
+
+      - name: Boot iOS Simulator
+        id: sim
+        run: |
+          RUNTIME=$(xcrun simctl list runtimes iOS -j | python3 -c "import sys,json; rts=json.load(sys.stdin)['runtimes']; print(rts[-1]['identifier'])" 2>/dev/null || echo "com.apple.CoreSimulator.SimRuntime.iOS-18-2")
+          echo "Using runtime: $RUNTIME"
+          DEVICE=$(xcrun simctl create "E2E-iPhone" "iPhone 16" "$RUNTIME")
+          echo "udid=$DEVICE" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$DEVICE"
+          echo "Waiting for simulator to finish booting..."
+          xcrun simctl bootstatus "$DEVICE" -b
+
+      - name: Build iOS (XCFramework + bindings)
+        run: ./scripts/ios-build --crate-name $FFI_CRATE
+
+      - name: Generate Xcode project
+        run: cd ios && xcodegen generate
+
+      - name: Build app and UI tests
+        run: |
+          cd ios
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -project *.xcodeproj \
+            -scheme Finder \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -skipMacroValidation \
+            -derivedDataPath build \
+            ARCHS=arm64 \
+            2>&1 | xcbeautify --is-ci
+
+      - name: Start screen recording
+        run: |
+          xcrun simctl io ${{ steps.sim.outputs.udid }} recordVideo \
+            --codec=h264 --force recording.mp4 &
+          echo $! > recorder.pid
+          sleep 2  # let recorder initialise
+
+      - name: Run UI test (launches app and scrolls)
+        run: |
+          cd ios
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project *.xcodeproj \
+            -scheme Finder \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build \
+            -only-testing:FinderUITests/FinderUITests/testCameraAndSearch \
+            2>&1 | xcbeautify --is-ci || true
+          sleep 2
+
+      - name: Stop screen recording
+        if: always()
+        run: |
+          if [ -f recorder.pid ]; then
+            PID=$(cat recorder.pid)
+            kill -INT "$PID" 2>/dev/null || true
+            # Wait for recorder to flush the file
+            for i in $(seq 1 15); do
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+          fi
+
+      - name: Upload video to Blossom
+        id: blossom
+        if: always()
+        run: |
+          if [ ! -f recording.mp4 ]; then
+            echo "::warning::No recording found"
+            echo "url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          URL=$(cargo run -p blossom-upload -- \
+            --server https://blossom.primal.net \
+            --server https://blossom.oxtr.dev \
+            recording.mp4 2>/dev/null || echo "")
+          if [ -z "$URL" ]; then
+            echo "::warning::Blossom upload failed, uploading as artifact instead"
+            echo "url=" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload video as artifact (fallback)
+        if: always() && steps.blossom.outputs.url == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-video-ios
+          path: recording.mp4
+          retention-days: 5
+          if-no-files-found: ignore
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = '${{ steps.blossom.outputs.url }}';
+            const runner = '${{ runner.os }} ${{ runner.arch }}';
+            const sha = '${{ github.event.pull_request.head.sha }}';
+            const shortSha = sha.substring(0, 7);
+
+            let videoLine;
+            if (url) {
+              videoLine = `[Watch the recording](${url})`;
+            } else {
+              videoLine = '_Recording uploaded as workflow artifact (Blossom upload failed)_';
+            }
+
+            const body = [
+              '## E2E Video — iOS',
+              '',
+              videoLine,
+              '',
+              `Recorded on: ${runner}`,
+              `Commit: ${shortSha}`,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Shutdown simulator
+        if: always()
+        run: xcrun simctl shutdown ${{ steps.sim.outputs.udid }} 2>/dev/null || true

@@ -1,0 +1,17 @@
+[package]
+name = "finder-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "finder_ffi"
+
+[dependencies]
+finder-core = { path = "../core" }
+uniffi = "0.31"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }

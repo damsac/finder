@@ -1,0 +1,12 @@
+/target/
+*.swp
+*.swo
+.DS_Store
+android/local.properties
+android/.gradle/
+android/app/build/
+android/build/
+ios/Frameworks/
+ios/Bindings/
+ios/.build/
+ios/*.xcodeproj

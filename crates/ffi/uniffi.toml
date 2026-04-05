@@ -1,0 +1,7 @@
+[bindings.kotlin]
+package_name = "dev.damsac.finder.rust"
+cdylib_name = "finder_ffi"
+
+[bindings.swift]
+module_name = "FinderCore"
+cdylib_name = "finder_ffi"

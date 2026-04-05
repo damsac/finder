@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# RMP iOS Build Script
+# Cross-compiles an FFI crate for iOS, generates Swift bindings, creates XCFramework.
+# Usage: ./scripts/ios-build --crate-name <crate> [--output-dir <dir>] [--release]
+#
+# The XCFramework bundles the static library with properly structured headers
+# and a module.modulemap so Swift can resolve the UniFFI C symbols at compile time.
+
+CRATE_NAME=""
+OUTPUT_DIR="ios"
+PROFILE="debug"
+PROFILE_DIR="debug"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --crate-name) CRATE_NAME="$2"; shift 2 ;;
+    --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --release) PROFILE="release"; PROFILE_DIR="release"; shift ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+if [ -z "$CRATE_NAME" ]; then
+  echo "Error: --crate-name is required"
+  echo "Usage: ./scripts/ios-build --crate-name <crate> [--output-dir <dir>] [--release]"
+  exit 1
+fi
+
+# Detect and fix Nix environment for iOS cross-compilation
+if [ -n "${NIX_CC:-}" ] || [ -n "${NIX_CFLAGS_COMPILE:-}" ]; then
+  echo "Detected Nix environment — unsetting variables that interfere with iOS cross-compilation"
+  unset SDKROOT NIX_CFLAGS_COMPILE NIX_LDFLAGS NIX_CC NIX_CC_WRAPPER_TARGET_HOST_x86_64_apple_darwin
+  unset MACOSX_DEPLOYMENT_TARGET
+  export CC=/usr/bin/clang
+  export CXX=/usr/bin/clang++
+  export AR=/usr/bin/ar
+fi
+
+TARGETS=("aarch64-apple-ios" "aarch64-apple-ios-sim")
+CARGO_FLAGS=()
+[ "$PROFILE" = "release" ] && CARGO_FLAGS+=("--release")
+
+# Determine the library name (crate name with hyphens replaced by underscores)
+LIB_NAME="${CRATE_NAME//-/_}"
+
+echo "=== Cross-compiling $CRATE_NAME for iOS ==="
+for target in "${TARGETS[@]}"; do
+  echo "Building for $target..."
+  cargo build -p "$CRATE_NAME" --target "$target" ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
+done
+
+echo "=== Building host library for UniFFI metadata ==="
+cargo build -p "$CRATE_NAME" ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
+
+echo "=== Generating Swift bindings ==="
+BINDINGS_DIR="$OUTPUT_DIR/Bindings"
+mkdir -p "$BINDINGS_DIR"
+
+# Discover the host library — try .dylib (macOS), .so (Linux), .a (static)
+HOST_LIB=""
+for ext in dylib so a; do
+  candidate="target/$PROFILE_DIR/lib${LIB_NAME}.$ext"
+  if [ -f "$candidate" ]; then
+    HOST_LIB="$candidate"
+    break
+  fi
+done
+if [ -z "$HOST_LIB" ]; then
+  echo "ERROR: Could not find host library for $LIB_NAME in target/$PROFILE_DIR/" >&2
+  echo "Looked for: .dylib, .so, .a" >&2
+  ls -la "target/$PROFILE_DIR/"lib${LIB_NAME}.* 2>/dev/null || echo "  (no matching files)" >&2
+  exit 1
+fi
+echo "  Using host library: $HOST_LIB"
+
+cargo run -p uniffi-bindgen generate \
+  --library "$HOST_LIB" \
+  --language swift \
+  --out-dir "$BINDINGS_DIR"
+
+echo "=== Staging headers for XCFramework ==="
+# xcodebuild -create-xcframework needs a clean headers directory containing
+# only the C header and a module.modulemap file. Passing the full Bindings dir
+# (which includes .swift files) breaks the framework structure.
+
+# Discover the UniFFI-generated header and modulemap.
+# UniFFI names these based on the module_name in uniffi.toml (e.g. MyAppCoreFFI.h),
+# NOT the cdylib_name — so we discover them rather than hardcoding.
+HEADER_FILE=$(find "$BINDINGS_DIR" -maxdepth 1 -name "*.h" | head -1)
+MODULEMAP_FILE=$(find "$BINDINGS_DIR" -maxdepth 1 -name "*.modulemap" | head -1)
+if [ -z "$HEADER_FILE" ] || [ -z "$MODULEMAP_FILE" ]; then
+  echo "ERROR: UniFFI did not generate expected header/modulemap in $BINDINGS_DIR" >&2
+  ls -la "$BINDINGS_DIR" >&2
+  exit 1
+fi
+FFI_MODULE=$(basename "$HEADER_FILE" .h)
+echo "  Detected FFI module: $FFI_MODULE"
+
+BUILD_DIR="$OUTPUT_DIR/.build"
+HEADERS_DIR="$BUILD_DIR/headers/${FFI_MODULE}"
+rm -rf "$BUILD_DIR"
+mkdir -p "$HEADERS_DIR"
+
+cp "$HEADER_FILE" "$HEADERS_DIR/${FFI_MODULE}.h"
+# xcodebuild requires the modulemap to be named module.modulemap
+cp "$MODULEMAP_FILE" "$HEADERS_DIR/module.modulemap"
+
+echo "=== Creating XCFramework ==="
+XCFRAMEWORK_DIR="$OUTPUT_DIR/Frameworks"
+rm -rf "$XCFRAMEWORK_DIR/${LIB_NAME}.xcframework"
+mkdir -p "$XCFRAMEWORK_DIR"
+
+xcodebuild -create-xcframework \
+  -library "target/aarch64-apple-ios/$PROFILE_DIR/lib${LIB_NAME}.a" \
+  -headers "$HEADERS_DIR" \
+  -library "target/aarch64-apple-ios-sim/$PROFILE_DIR/lib${LIB_NAME}.a" \
+  -headers "$HEADERS_DIR" \
+  -output "$XCFRAMEWORK_DIR/${LIB_NAME}.xcframework"
+
+# Clean up staging directory
+rm -rf "$BUILD_DIR"
+
+echo "=== Verifying XCFramework structure ==="
+# Confirm the framework has headers in every slice
+for slice_dir in "$XCFRAMEWORK_DIR/${LIB_NAME}.xcframework"/*/; do
+  if [ -d "$slice_dir" ] && [ "$(basename "$slice_dir")" != "Info.plist" ]; then
+    if [ ! -f "${slice_dir}Headers/${FFI_MODULE}.h" ]; then
+      echo "ERROR: Missing header in $(basename "$slice_dir")" >&2
+      exit 1
+    fi
+    if [ ! -f "${slice_dir}Headers/module.modulemap" ]; then
+      # Some xcodebuild versions place it as Modules/module.modulemap
+      if [ ! -f "${slice_dir}Modules/module.modulemap" ]; then
+        echo "ERROR: Missing module.modulemap in $(basename "$slice_dir")" >&2
+        exit 1
+      fi
+    fi
+    echo "  $(basename "$slice_dir"): headers OK"
+  fi
+done
+
+echo "=== Done ==="
+echo "XCFramework: $XCFRAMEWORK_DIR/${LIB_NAME}.xcframework"
+echo "Swift bindings: $BINDINGS_DIR/"
